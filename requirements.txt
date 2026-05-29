@@ -1,0 +1,7 @@
+openai
+python-dotenv
+mcp
+httpx
+ddgs
+tavily-python
+crawl4ai
