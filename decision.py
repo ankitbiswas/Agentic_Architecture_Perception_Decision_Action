@@ -35,6 +35,10 @@ RULES:
   you MUST base your answer on specific items found in the memory hits or
   history. Reference them by name. Do not give generic advice — use the
   concrete data from prior answers.
+- TOOL CHOICE: When the goal says "fetch a URL" or "fetch a page", use
+  fetch_url (not web_search). web_search is for open-ended queries without
+  a specific URL. If a URL is provided, always use fetch_url to get the
+  full page content.
 """
 
 
@@ -64,11 +68,22 @@ class Decider:
             {"descriptor": h.descriptor}
             for h in hits
         ]
+        hist = [] 
+        for his in history:
+            hist.append({
+                    "iteration": his.get("iteration"),
+                    "goal_id": his.get("goal_id"),
+                    "goal_text": his.get("goal_text"),
+                    "action": his.get("action"),
+                    "arguments": his.get("arguments"),
+                    "result": his.get("result"),
+                })
+
 
         user_message = {
             "goal": goal.text,
             "attach_artifact_id": goal.attach_artifact_id,
-            "history": history,
+            "history": hist,
             "memory_hits": hit_context,
         }
 

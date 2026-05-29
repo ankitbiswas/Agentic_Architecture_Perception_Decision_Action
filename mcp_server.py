@@ -122,39 +122,64 @@ def _ddg_search(query: str, max_results: int) -> list[dict]:
     ]
 
 
-async def _crawl4ai_fetch(url: str) -> dict:
-    from crawl4ai import AsyncWebCrawler
+async def _httpx_fetch(url: str, timeout: int = 30) -> dict:
+    """Fetch a URL with httpx. For Wikipedia URLs, uses the API directly.
+    For other URLs, fetches HTML and converts to markdown via html2text.
+    No headless browser, no fd tricks — safe for MCP stdio transport."""
+    import html2text
+    import re
 
-    # crawl4ai uses Rich which writes via its own captured stdout reference, so
-    # contextlib.redirect_stdout doesn't catch it. Redirect at the file-descriptor
-    # level — crawl4ai's banner / [FETCH] / [SCRAPE] markers would otherwise
-    # corrupt the MCP stdio JSON-RPC stream.
-    saved_fd = os.dup(1)
-    os.dup2(2, 1)
-    try:
-        async with AsyncWebCrawler(verbose=False) as crawler:
-            r = await crawler.arun(url=url)
-    finally:
-        os.dup2(saved_fd, 1)
-        os.close(saved_fd)
-    # r.markdown is a str subclass (StringCompatibleMarkdown) that Pydantic
-    # serializes as {} because its real field is private. Pull the raw string
-    # out and force a plain str so FastMCP serializes correctly.
-    md = r.markdown
-    raw = (
-        getattr(md, "raw_markdown", None)
-        or getattr(md, "fit_markdown", None)
-        or md
-        or r.cleaned_html
-        or r.html
-        or ""
-    )
-    text = str(raw)
+    WIKI_API_RE = re.compile(r"https?://([a-z]+)\.wikipedia\.org/wiki/(.+)", re.I)
+    UA = "EAGV3Agent/1.0 (https://github.com/eagv3; bot@example.com)"
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        # Wikipedia: use the API for clean plaintext extracts
+        m = WIKI_API_RE.match(url)
+        if m:
+            lang = m.group(1)
+            title = m.group(2)
+            api_url = f"https://{lang}.wikipedia.org/w/api.php"
+            r = await client.get(api_url, headers={"User-Agent": UA}, params={
+                "action": "query",
+                "titles": title,
+                "prop": "extracts",
+                "explaintext": 1,
+                "format": "json",
+                "redirects": 1,
+            })
+            r.raise_for_status()
+            data = r.json()
+            pages = data.get("query", {}).get("pages", {})
+            text = ""
+            for _pid, page in pages.items():
+                text = page.get("extract", "")
+                break
+            return {
+                "status": r.status_code,
+                "content_type": "text/plain",
+                "length_bytes": len(text.encode("utf-8")),
+                "text": text,
+            }
+
+        # Generic URL: fetch HTML, convert to markdown
+        r = await client.get(url, headers={
+            "User-Agent": UA,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        })
+        r.raise_for_status()
+
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    h.body_width = 0
+    markdown = h.handle(r.text)
+
     return {
-        "status": int(getattr(r, "status_code", None) or 200),
+        "status": r.status_code,
         "content_type": "text/markdown",
-        "length_bytes": len(text.encode("utf-8")),
-        "text": text,
+        "length_bytes": len(markdown.encode("utf-8")),
+        "text": markdown,
     }
 
 
@@ -176,9 +201,9 @@ def web_search(query: str, max_results: int = 5) -> list[dict]:
 
 
 @mcp.tool()
-async def fetch_url(url: str, timeout: int = 20) -> dict:
-    """Fetch clean markdown from a URL via crawl4ai (headless Chromium). Example: fetch_url("https://example.com")."""
-    return await _crawl4ai_fetch(url)
+async def fetch_url(url: str, timeout: int = 30) -> dict:
+    """Fetch clean markdown from a URL via httpx + html2text. Example: fetch_url("https://example.com")."""
+    return await _httpx_fetch(url, timeout=timeout)
 
 
 @mcp.tool()
