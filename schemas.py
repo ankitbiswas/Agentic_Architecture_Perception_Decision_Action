@@ -30,7 +30,7 @@ class Goal(BaseModel):
     id: str
     text: str                  # short imperative description
     done: bool
-    attach_artifact_id: str | None
+    attach_artifact_ids: list[str] = Field(default_factory=list)
 
 
 class Observation(BaseModel):

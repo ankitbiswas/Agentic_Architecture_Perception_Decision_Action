@@ -1,28 +1,59 @@
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+from artifact import ArtifactStore
 from schemas import MemoryItem, Goal, Observation
 
 load_dotenv()
 
 
 GOAL_DECOMPOSITION_PROMPT = """\
-You are a goal tracker. Your job is to maintain a goal list and mark goals done.
+You are an agent that maintains a goal list. Your job is to decompose user
+queries into concrete, executable goals and mark them done as work progresses.
 
 INPUT: user query, memory hits (with artifact indices), run history, prior goal list.
 
 RULES:
-1. If prior_goals is empty: decompose the query into 1-5 bounded goals. Each goal is a short imperative statement.
-2. For each prior goal: examine the run history. Mark it done:true the moment history contains an action that satisfies it. Once done, stays done.
-3. For the first unfinished goal: if it needs raw bytes from a previously fetched artifact, set attach_artifact_id to the artifact handle (e.g. "art:abc123"). Otherwise leave null.
+1. If prior_goals is empty: decompose the query into 1-5 bounded goals. Each
+   goal is a short imperative statement. Be specific — include URLs, counts,
+   and concrete criteria from the query.
+2. For each prior goal: examine the run history. Mark it done:true the moment
+   history contains an action that satisfies it. Once done, stays done.
+3. For the first unfinished goal: if it needs raw bytes from previously
+   fetched artifacts, set attach_artifact_ids to the list of artifact handles
+   (e.g. ["art:abc123", "art:def456"]). Otherwise leave as empty list [].
 4. Preserve goal order. Do not reorder, insert in middle, or drop goals.
-5. Use artifact_index (integer) to reference memory hit artifacts. The system maps indices to actual handles.
+5. Use artifact_index (integer) to reference memory hit artifacts. The system
+   maps indices to actual handles.
 
-RULES (continued):
-6. When a later goal depends on the output of an earlier goal, phrase it to
+CRITICAL — DYNAMIC RE-DECOMPOSITION:
+6. When a goal says "read the top N results" or "fetch the top N" and the
+   attached artifact_content contains search results with URLs, you MUST
+   REPLACE that single goal with N concrete fetch goals — one per URL.
+   Extract the exact URLs from the artifact_content. Then add a final
+   synthesis goal. Example:
+
+   BEFORE (vague):
+     g0: "Search for X" (done: true)
+     g1: "Read the top 3 results" (done: false, attach_artifact_ids: ["art:xyz"])
+
+   AFTER (concrete), given artifact_content has urls A, B, C:
+     g0: "Search for X" (done: true)
+     g1: "Fetch and read <URL-A>" (done: false)
+     g2: "Fetch and read <URL-B>" (done: false)
+     g3: "Fetch and read <URL-C>" (done: false)
+     g4: "Synthesize findings from the 3 fetched articles" (done: false)
+
+7. When a later goal depends on the output of an earlier goal, phrase it to
    explicitly reference that dependency. Use phrases like "from the X found
    above" or "based on the Y retrieved earlier" so the decision layer knows
    to look at prior answers in memory.
+
+8. SYNTHESIS GOAL ARTIFACT ATTACHMENT: When a synthesis goal (e.g. "identify
+   advice agreed upon across the N articles") follows completed fetch_url
+   goals, set attach_artifact_ids to ALL artifact_ids from the completed
+   fetch actions in history. The decider will receive all of them and can
+   cross-reference their contents.
 
 EXAMPLES:
 
@@ -53,7 +84,28 @@ Prior goals: ["Fetch the latest docs" (done: true), "Summarize the fetched docs"
 Artifact index: [{"index": 0, "artifact_id": "art:abc123", "descriptor": "fetched docs content"}]
 Output goals:
   - "Fetch the latest docs" (done: true)
-  - "Summarize the fetched docs" (done: false, attach_artifact_id: "art:abc123")
+  - "Summarize the fetched docs" (done: false, attach_artifact_ids: ["art:abc123"])
+
+--- Dynamic re-decomposition (read top N) ---
+Query: "Search for Python tips, read the top 2 results, and summarize"
+Prior goals: ["Search for Python tips" (done: true), "Read the top 2 results" (done: false, attach_artifact_ids: ["art:def456"])]
+Artifact index: [{"index": 0, "artifact_id": "art:def456", "descriptor": "search results for Python tips"}]
+Artifact content for art:def456: "[{\"title\": \"10 Python Tips\", \"url\": \"https://example.com/tips\"}, {\"title\": \"Python Best Practices\", \"url\": \"https://example.com/best\"}]"
+Output goals:
+  - "Search for Python tips" (done: true)
+  - "Fetch and read https://example.com/tips" (done: false)
+  - "Fetch and read https://example.com/best" (done: false)
+  - "Summarize findings from the 2 fetched articles" (done: false)
+
+--- Synthesis goal artifact attachment ---
+Query: "Search for Python tips, read the top 2 results, and summarize"
+Prior goals: ["Search for Python tips" (done: true), "Fetch and read https://example.com/tips" (done: true), "Fetch and read https://example.com/best" (done: true), "Summarize findings from the 2 fetched articles" (done: false)]
+History: [..., {"action": "fetch_url", "result": "...", "artifact_id": "art:aaa111"}, {"action": "fetch_url", "result": "...", "artifact_id": "art:bbb222"}]
+Output goals:
+  - "Search for Python tips" (done: true)
+  - "Fetch and read https://example.com/tips" (done: true)
+  - "Fetch and read https://example.com/best" (done: true)
+  - "Summarize findings from the 2 fetched articles" (done: false, attach_artifact_ids: ["art:aaa111", "art:bbb222"])
 """
 
 
@@ -62,9 +114,10 @@ class Perceiver:
     """Maintains state across iterations. Decomposes query into goals, tracks
     completion, and attaches artifacts to the next unfinished goal."""
 
-    def __init__(self, model: str = "gpt-4o") -> None:
+    def __init__(self, artifacts: ArtifactStore, model: str = "gpt-4o") -> None:
         self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self._model = model
+        self._artifacts = artifacts
 
     def observe(
         self,
@@ -98,9 +151,34 @@ class Perceiver:
             if hit.artifact_id
         ]
 
+        # Resolve artifact content for any goal that has attach_artifact_id
+        # AND for any completed fetch_url in history that produced an artifact.
+        # This ensures synthesis goals see ALL fetched article contents.
+        artifact_contents: dict[str, str] = {}
+        seen: set[str] = set()
+
+        def _add_artifact(aid: str) -> None:
+            if not aid or aid in seen:
+                return
+            seen.add(aid)
+            art = self._artifacts.get(aid)
+            if art:
+                raw = art.raw_bytes
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                artifact_contents[aid] = raw[:6000]
+
+        for g in prior_goals:
+            for aid in g.attach_artifact_ids:
+                _add_artifact(aid)
+
+        for entry in history:
+            _add_artifact(entry.get("artifact_id"))
+
         user_message = {
             "query": query,
             "artifact_index": artifact_index,
+            "artifact_contents": artifact_contents,
             "history": history,
             "prior_goals": [g.model_dump() for g in prior_goals],
         }
@@ -134,6 +212,6 @@ class Perceiver:
                 id=goal_id,
                 text=goal.text,
                 done=goal.done,
-                attach_artifact_id=goal.attach_artifact_id,
+                attach_artifact_ids=goal.attach_artifact_ids,
             ))
         return result

@@ -52,8 +52,8 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
 
     artifacts = ArtifactStore()
     memory = Memory()
-    perceiver = Perceiver()
-    decider = Decider()
+    perceiver = Perceiver(artifacts=artifacts)
+    decider = Decider(artifacts=artifacts)
     actor = Actor(artifacts)
     decision_list =[]
     long_term_memory = long_memory if long_memory is not None and len(long_memory) > 0 else []  # Pass long-term memory as an argument and return updated version
@@ -107,7 +107,7 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                     id=f"{run_id}-summary",
                     text="Summarize all findings into a cohesive final answer for the user",
                     done=False,
-                    attach_artifact_id=None,
+                    attach_artifact_ids=[],
                 )
                 final_decision = decider.decide(summary_goal, hits,history, tools)
                 if final_decision.answer:

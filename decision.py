@@ -2,6 +2,7 @@ import json
 import os
 from dotenv import load_dotenv
 from openai import OpenAI
+from artifact import ArtifactStore
 from schemas import Goal, MemoryItem, DecisionOutput, ToolCall
 
 load_dotenv()
@@ -29,8 +30,10 @@ RULES:
 - If the goal requires fetching data, searching, reading files, or any external
   action, return a tool_call with the appropriate tool name and arguments.
 - Use only tools from the provided tool list. Match the tool's input schema.
-- If an artifact is attached to the goal, its content is available in the
-  memory hits — use it to answer directly when possible.
+- If artifacts are attached to the goal (attach_artifact_ids is non-empty),
+  their full contents are provided in the "artifact_content" field below,
+  delimited by "--- BEGIN art:xxx ---" / "--- END art:xxx ---" markers.
+  Use them to answer directly instead of making new tool calls.
 - When the goal asks you to pick, compare, rank, or choose between options,
   you MUST base your answer on specific items found in the memory hits or
   history. Reference them by name. Do not give generic advice — use the
@@ -39,6 +42,11 @@ RULES:
   fetch_url (not web_search). web_search is for open-ended queries without
   a specific URL. If a URL is provided, always use fetch_url to get the
   full page content.
+- CROSS-REFERENCING: When the goal asks what multiple sources "agree on" or
+  asks for "common" advice across articles, you MUST only include points that
+  appear in EVERY source. Cite all agreeing sources per point. Do NOT list
+  advice that only appears in one source. If artifact_content contains
+  multiple articles, compare them and find the intersection.
 """
 
 
@@ -46,9 +54,10 @@ class Decider:
     """Decides what action to take for the next unfinished goal. Calls an LLM
     to choose between answering directly or invoking a tool."""
 
-    def __init__(self, model: str = "gpt-4o") -> None:
+    def __init__(self, artifacts: ArtifactStore, model: str = "gpt-4o") -> None:
         self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         self._model = model
+        self._artifacts = artifacts
 
     def decide(
         self,
@@ -65,7 +74,7 @@ class Decider:
 
         # Gather relevant context from memory hits
         hit_context = [
-            {"descriptor": h.descriptor}
+            {"descriptor": h.descriptor , "memory_value": h.value}
             for h in hits
         ]
         hist = [] 
@@ -82,10 +91,23 @@ class Decider:
 
         user_message = {
             "goal": goal.text,
-            "attach_artifact_id": goal.attach_artifact_id,
+            "attach_artifact_ids": goal.attach_artifact_ids,
             "history": hist,
             "memory_hits": hit_context,
         }
+
+        # Resolve ALL attached artifacts into a single artifact_content blob.
+        # Each artifact is prefixed with its ID so the LLM can tell them apart.
+        artifact_parts: list[str] = []
+        for aid in goal.attach_artifact_ids:
+            art = self._artifacts.get(aid)
+            if art:
+                raw = art.raw_bytes
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                artifact_parts.append(f"--- BEGIN {aid} ---\n{raw[:6000]}\n--- END {aid} ---")
+
+        user_message["artifact_content"] = "\n\n".join(artifact_parts) if artifact_parts else None
 
         response = self._client.chat.completions.create(
             model=self._model,
