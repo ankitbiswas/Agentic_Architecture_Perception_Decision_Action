@@ -81,7 +81,7 @@ Output goals:
 
 --- Artifact attachment ---
 Prior goals: ["Fetch the latest docs" (done: true), "Summarize the fetched docs" (done: false)]
-Artifact index: [{"index": 0, "artifact_id": "art:abc123", "descriptor": "fetched docs content"}]
+Artifact index values: [{"index": 0, "artifact_id": "art:abc123", "descriptor": "fetched docs content"}]
 Output goals:
   - "Fetch the latest docs" (done: true)
   - "Summarize the fetched docs" (done: false, attach_artifact_ids: ["art:abc123"])
@@ -89,7 +89,7 @@ Output goals:
 --- Dynamic re-decomposition (read top N) ---
 Query: "Search for Python tips, read the top 2 results, and summarize"
 Prior goals: ["Search for Python tips" (done: true), "Read the top 2 results" (done: false, attach_artifact_ids: ["art:def456"])]
-Artifact index: [{"index": 0, "artifact_id": "art:def456", "descriptor": "search results for Python tips"}]
+Artifact index values: [{"index": 0, "artifact_id": "art:def456", "descriptor": "search results for Python tips"}]
 Artifact content for art:def456: "[{\"title\": \"10 Python Tips\", \"url\": \"https://example.com/tips\"}, {\"title\": \"Python Best Practices\", \"url\": \"https://example.com/best\"}]"
 Output goals:
   - "Search for Python tips" (done: true)
@@ -145,40 +145,15 @@ class Perceiver:
         run_id: str,
     ) -> list[Goal]:
         # Build artifact index so LLM can reference hits by integer position
-        artifact_index = [
+        artifact_index_values = [
             {"index": i, "artifact_id": hit.artifact_id, "descriptor": hit.descriptor}
             for i, hit in enumerate(hits)
             if hit.artifact_id
         ]
 
-        # Resolve artifact content for any goal that has attach_artifact_id
-        # AND for any completed fetch_url in history that produced an artifact.
-        # This ensures synthesis goals see ALL fetched article contents.
-        artifact_contents: dict[str, str] = {}
-        seen: set[str] = set()
-
-        def _add_artifact(aid: str) -> None:
-            if not aid or aid in seen:
-                return
-            seen.add(aid)
-            art = self._artifacts.get(aid)
-            if art:
-                raw = art.raw_bytes
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8")
-                artifact_contents[aid] = raw[:6000]
-
-        for g in prior_goals:
-            for aid in g.attach_artifact_ids:
-                _add_artifact(aid)
-
-        for entry in history:
-            _add_artifact(entry.get("artifact_id"))
-
         user_message = {
             "query": query,
-            "artifact_index": artifact_index,
-            "artifact_contents": artifact_contents,
+            "artifact_index_values": artifact_index_values,
             "history": history,
             "prior_goals": [g.model_dump() for g in prior_goals],
         }

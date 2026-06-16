@@ -5,3 +5,5 @@ httpx
 ddgs
 tavily-python
 crawl4ai
+faiss-cpu
+numpy

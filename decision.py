@@ -105,7 +105,7 @@ class Decider:
                 raw = art.raw_bytes
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8")
-                artifact_parts.append(f"--- BEGIN {aid} ---\n{raw[:6000]}\n--- END {aid} ---")
+                artifact_parts.append(f"--- BEGIN {aid} ---\n{raw[:8000]}\n--- END {aid} ---")
 
         user_message["artifact_content"] = "\n\n".join(artifact_parts) if artifact_parts else None
 

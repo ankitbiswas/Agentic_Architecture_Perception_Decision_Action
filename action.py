@@ -23,10 +23,10 @@ class Actor:
             artifact = self._artifacts.put(
                 content_type="text/plain",
                 source=tool_call.name,
-                descriptor=f"Output of {tool_call.name} is {text[:500]}",
+                descriptor=f"Output of {tool_call.name} is {text[:4000]}",
                 raw_bytes=text.encode("utf-8"),
             )
-            preview = text[:2000]
+            preview = text[:3000]
             descriptor = (
                 f"artifact size: {artifact.size_bytes} bytes "
                 f"preview: {preview}"

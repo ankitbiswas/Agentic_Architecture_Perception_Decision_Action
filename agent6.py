@@ -11,6 +11,7 @@ from memory import Memory
 from decision import Decider
 from action import Actor
 from artifact import ArtifactStore
+from vector_store import VectorStore
 from schemas import Goal, MemoryItem
 
 MAX_ITERATIONS = 10
@@ -52,6 +53,7 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
 
     artifacts = ArtifactStore()
     memory = Memory()
+    vectors = VectorStore()
     perceiver = Perceiver(artifacts=artifacts)
     decider = Decider(artifacts=artifacts)
     actor = Actor(artifacts)
@@ -87,6 +89,16 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                         confidence=mem.get("confidence", 1.0),
                         created_at=mem.get("created_at") or datetime.now(),
                     ))
+        val = mem.get("value", {})
+        text = val.get("answer")
+        if text:
+            vectors.add(str(text)[:8000], {
+                "kind": mem.get("kind", "fact"),
+                "source": "long_term",
+                "goal_id": mem.get("goal_id"),
+                "run_id": mem.get("run_id", ""),
+                "artifact_id": None,
+            })
 
 
     async with mcp_session() as session:
@@ -94,8 +106,27 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
         tools = mcp_tools_for_decision(mcp_tools)
 
         for iteration in range(1, MAX_ITERATIONS + 1):
-            # 1. Memory: retrieve relevant hits
-            hits = memory.read(query, history)
+            # 1. Memory: vector search first, keyword fallback
+            vector_results = vectors.search(query)
+            if vector_results:
+                hits = [
+                    MemoryItem(
+                        id=f"vec-{run_id}-{r['chunk_index']}",
+                        kind=r.get("kind", "fact"),
+                        keywords=r.get("keywords", []),
+                        descriptor=r.get("chunk_text", ""),
+                        value={"vector_hit": r, "score": r.get("score", 0)},
+                        artifact_id=r.get("artifact_id"),
+                        source="vector_store",
+                        run_id=r.get("run_id", run_id),
+                        goal_id=r.get("goal_id"),
+                        confidence=r.get("score", 0.5),
+                        created_at=datetime.now(),
+                    )
+                    for r in vector_results
+                ]
+            else:
+                hits = memory.read(query)
 
             # 2. Perception: observe state, update goals
             obs = perceiver.observe(query, hits, history, prior_goals, run_id)
@@ -116,7 +147,7 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                         "kind": final_decision.kind,
                         "keywords": final_decision.keywords,
                         "descriptor": f"Final answer for query: {query}",
-                        "value": {"answer": final_decision.answer, "goal_text": summary_goal.text},
+                        "value": {"answer": final_decision.answer},
                         "artifact_id": None,
                         "source": "final_decision",
                         "run_id": run_id,
@@ -124,6 +155,7 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                         "confidence": 1.0,
                         "created_at": datetime.now(),
                         })
+
                 return final_decision.answer or "No summary produced.", long_term_memory
 
             # 4. Decision: pick first unfinished goal, call LLM
@@ -142,16 +174,16 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                     "goal_text": next_goal.text,
                     "action": decision.tool_call.name,
                     "arguments": decision.tool_call.arguments,
-                    "result": result_text,
+                    "result": "",
                     "artifact_id": art_id,
                 })
-                # Store tool outcome in memory
+                # Store tool outcome in memory + FAISS
                 memory.add(
                     MemoryItem(
                         id=f"mem-{run_id}-t{iteration}",
                         kind="tool_outcome",
                         keywords=[],
-                        descriptor=f"Tool {decision.tool_call.name}: {result_text[:1000]}" if art_id else f"Tool {decision.tool_call.name}: {result_text[:500]}",
+                        descriptor=f"Tool {decision.tool_call.name}: {result_text[:2500]}",
                         value={
                             "tool": decision.tool_call.name,
                             "arguments": decision.tool_call.arguments,
@@ -165,8 +197,15 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                         created_at=datetime.now(),
                     ),
                 )
+                vectors.add(result_text[:8000], {
+                    "kind": "tool_outcome",
+                    "tool": decision.tool_call.name,
+                    "goal_text": next_goal.text,
+                    "goal_id": next_goal.id,
+                    "run_id": run_id,
+                    "artifact_id": art_id,
+                })
             else:
-                decision_list.append(decision.answer)
                 history.append({
                     "iteration": iteration,
                     "goal_id": next_goal.id,
@@ -174,7 +213,7 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                     "action": "answer",
                     "result": decision.answer,
                 })
-                # Store answer in memory so later goals can use it
+                # Store answer in memory + FAISS so later goals can use it
                 memory.add(
                     MemoryItem(
                         id=f"mem-{run_id}-a{iteration}",
@@ -190,6 +229,13 @@ async def run(query: str, long_memory: list[dict]|None) -> tuple[str, list[dict]
                         created_at=datetime.now(),
                     )
                 )
+                vectors.add(decision.answer or "", {
+                    "kind": decision.kind or "fact",
+                    "goal_text": next_goal.text,
+                    "goal_id": next_goal.id,
+                    "run_id": run_id,
+                    "keywords": decision.keywords,
+                })
     return "Max iterations reached without completing all goals."
 
 
